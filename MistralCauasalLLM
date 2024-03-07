@@ -1,0 +1,273 @@
+pip install -q datasets trl peft bitsandbytes sentencepiece wandb
+
+
+
+import os
+import gc
+import torch
+from datetime import datetime
+
+import transformers
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, BitsAndBytesConfig,AutoModelForSequenceClassification, AutoModelForSlidingWindowAttention,Pruner, ModelParallel
+from datasets import load_dataset
+from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
+from trl import DPOTrainer
+import bitsandbytes as bnb
+from google.colab import userdata
+import wandb
+
+# Defined in the secrets tab in Google Colab
+hf_token = userdata.get('huggingface')
+wb_token = userdata.get('wandb')
+wandb.login(key=wb_token)
+
+model_name = "teknium/OpenHermes-2.5-Mistral-7B"
+new_model = "New_model-2.5-Mistral-7B"
+
+
+def chatml_format(example):
+    # Format system
+    if len(example['system']) > 0:
+        message = {"role": "system", "content": example['system']}
+        system = tokenizer.apply_chat_template([message], tokenize=False)
+    else:
+        system = ""
+
+    # Format instruction
+    message = {"role": "user", "content": example['question']}
+    prompt = tokenizer.apply_chat_template([message], tokenize=False, add_generation_prompt=True)
+
+    # Format chosen answer
+    chosen = example['chosen'] + "<|im_end|>\n"
+
+    # Format rejected answer
+    rejected = example['rejected'] + "<|im_end|>\n"
+
+    return {
+        "prompt": system + prompt,
+        "chosen": chosen,
+        "rejected": rejected,
+    }
+
+# Load dataset
+dataset = load_dataset("Intel/orca_dpo_pairs")['train']
+
+# Save columns
+original_columns = dataset.column_names
+
+# Tokenizer
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = "left"
+
+# Format dataset
+dataset = dataset.map(
+    chatml_format,
+    remove_columns=original_columns
+)
+
+
+peft_config = LoraConfig(
+    r=64,
+    lora_alpha=16,
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_LM",
+    target_modules=['k_proj', 'gate_proj', 'v_proj', 'up_proj', 'q_proj', 'o_proj', 'down_proj']
+)
+
+
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    torch_dtype=torch.float16,
+    load_in_4bit=True
+)
+model.config.use_cache = False
+
+# Reference model
+ref_model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    torch_dtype=torch.float16,
+    load_in_4bit=True
+)
+
+
+
+training_args = TrainingArguments(
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=4,
+    gradient_checkpointing=True,
+    learning_rate=5e-5,
+    lr_scheduler_type="cosine",
+    max_steps=200,
+    save_strategy="no",
+    logging_steps=1,
+    output_dir=new_model,
+    optim="paged_adamw_32bit",
+    warmup_steps=100,
+    bf16=True,
+    report_to="wandb",
+)
+
+# Create DPO trainer
+dpo_trainer = DPOTrainer(
+    model,
+    ref_model,
+    args=training_args,
+    train_dataset=dataset,
+    tokenizer=tokenizer,
+    peft_config=peft_config,
+    beta=0.1,
+    max_prompt_length=1024,
+    max_length=1536,
+)
+
+# Fine-tune model with DPO
+dpo_trainer.train()
+
+#Fine-tuning ends 
+
+
+dpo_trainer.model.save_pretrained("final_checkpoint")
+tokenizer.save_pretrained("final_checkpoint")
+
+# Flush memory
+del dpo_trainer, model, ref_model
+gc.collect()
+torch.cuda.empty_cache()
+
+# Reload model in FP16 (instead of NF4)
+base_model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    return_dict=True,
+    torch_dtype=torch.float16,
+)
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+# Merge base model with the adapter
+model = PeftModel.from_pretrained(base_model, "final_checkpoint")
+model = model.merge_and_unload()
+
+# Save model and tokenizer
+model.save_pretrained(new_model)
+tokenizer.save_pretrained(new_model)
+
+# Push them to the HF Hub
+model.push_to_hub(new_model, use_temp_dir=False, token=hf_token)
+tokenizer.push_to_hub(new_model, use_temp_dir=False, token=hf_token)
+
+
+
+# Define constants
+BATCH_SIZE = 4  # Number of prompts to process simultaneously
+INPUT_SIZE = 128
+OUTPUT_SIZE = 128
+TOTAL_TOKENS = INPUT_SIZE + OUTPUT_SIZE
+TARGET_THROUGHPUT = 200  # tokens per second
+GPU = "cuda:0"  # NVIDIA Tesla T4
+MODEL_DTYPE = torch.float16  # Choose any dtype supported by the GPU
+CONCURRENCY = 32  # Number of parallel inference tasks
+ 
+
+# Load Mistral model and tokenizer
+mistral_model = AutoModelForCausalLM.from_pretrained(new_model).to(GPU).half()
+mistral_tokenizer = AutoTokenizer.from_pretrained(new_model)
+ 
+# Load Flash Attention 2 model and tokenizer
+flash_model_path = 'HuggingFaceM4/siglip-so400m-14-980-flash-attn2-navit'
+flash_model = AutoModelForSequenceClassification.from_pretrained(flash_model_path).to(GPU).half()
+flash_tokenizer = AutoTokenizer.from_pretrained(flash_model_path)
+ 
+# Load Sliding Window Attention model and tokenizer
+swa_model_path = 'Pramodith/bert-sparse-sliding-window-attention'
+swa_model = AutoModelForSlidingWindowAttention.from_pretrained(swa_model_path).to(GPU).half()
+swa_tokenizer = AutoTokenizer.from_pretrained(swa_model_path)
+ 
+# Warm-up CUDA for Mistral
+mistral_warmup_input = mistral_tokenizer(" ", return_tensors="pt").input_ids.to(GPU)
+mistral_model.generate(input_ids=mistral_warmup_input)
+ 
+# Prune models
+pruned_mistral_model = Pruner.apply(mistral_model, amount=0.3)  # Prune 30% of the model parameters
+pruned_flash_model = Pruner.apply(flash_model, amount=0.3)
+pruned_swa_model = Pruner.apply(swa_model, amount=0.3)
+ 
+# Distribute models across multiple GPUs using model parallelism
+parallel_mistral_model = ModelParallel(pruned_mistral_model)
+parallel_flash_model = ModelParallel(pruned_flash_model)
+parallel_swa_model = ModelParallel(pruned_swa_model)
+ 
+# Function to process a single prompt using Mistral
+def process_prompt_with_mistral(prompt):
+    tokenized_prompt = mistral_tokenizer(prompt, return_tensors="pt", max_length=INPUT_SIZE, truncation=True, padding="max_length")
+    input_ids = tokenized_prompt.input_ids.to(GPU)
+    outputs = parallel_mistral_model.generate(input_ids, max_length=OUTPUT_SIZE)
+    return mistral_tokenizer.decode(outputs[0], skip_special_tokens=True)
+ 
+# Function to process a single prompt using Flash Attention 2
+def process_prompt_with_flash(prompt):
+    tokenized_prompt = flash_tokenizer(prompt, return_tensors="pt", max_length=INPUT_SIZE, truncation=True, padding="max_length")
+    input_ids = tokenized_prompt.input_ids.to(GPU)
+    outputs = parallel_flash_model(input_ids)
+    return outputs.logits.argmax(-1)
+ 
+# Function to process a single prompt using Sliding Window Attention
+def process_prompt_with_swa(prompt):
+    tokenized_prompt = swa_tokenizer(prompt, return_tensors="pt", max_length=INPUT_SIZE, truncation=True, padding="max_length")
+    input_ids = tokenized_prompt.input_ids.to(GPU)
+    outputs = parallel_swa_model(input_ids)
+    return outputs.logits.argmax(-1)
+
+
+# User input prompt loop
+while True:
+    prompts = []
+    for _ in range(BATCH_SIZE):
+        prompt = input("Enter your prompt: ")
+        prompts.append(prompt)
+ 
+    start_time = datetime.now()
+ 
+    with torch.no_grad():
+        responses = []
+        for i in range(0, BATCH_SIZE, CONCURRENCY):
+            batch_prompts = prompts[i:i+CONCURRENCY]
+            batch_responses = []
+            for prompt in batch_prompts:
+                # Choose the model for processing based on the prompt or any other criteria
+                if len(prompt) < 50:
+                    response = process_prompt_with_mistral(prompt)  # Example: Process short prompts with Mistral
+                elif len(prompt) < 100:
+                    response = process_prompt_with_flash(prompt)    # Example: Process medium-length prompts with Flash Attention 2
+                else:
+                    response = process_prompt_with_swa(prompt)      # Example: Process long prompts with Sliding Window Attention
+                
+                batch_responses.append(response)
+            responses.extend(batch_responses)
+ 
+    end_time = datetime.now()
+ 
+    inference_time = (end_time - start_time).total_seconds()
+    throughput = BATCH_SIZE * TOTAL_TOKENS / inference_time
+ 
+    for i, response in enumerate(responses):
+        print(f"Prompt {i + 1} response: {response}")
+ 
+    print(f"Total throughput: {throughput:.2f} tokens/sec")
+ 
+    if throughput >= TARGET_THROUGHPUT:
+        print("Benchmark achieved!")
+    else:
+        print("Benchmark not achieved.")
+
+ 
+
+
+
+
+
+
+
+
+
+
